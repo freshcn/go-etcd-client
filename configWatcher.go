@@ -17,18 +17,29 @@ type ConfigWatcher struct {
 	// Prefix 配置的前缀
 	Prefix string
 
-	array map[string]ConfigWatcherItem
+	dataMap map[string]ConfigWatcherItem
 
 	close bool
 
-	lock sync.Mutex
+	lock sync.RWMutex
+
+	hooksChan chan configWatcherHook
+
+	hooksLock   sync.RWMutex
+	changeHooks []configWatcherHook
 }
+
+var (
+	hooksCap = 10
+)
 
 // NewConfigWatcher 创建一个新的配置监听对象
 func NewConfigWatcher(prefix string) (rs ConfigWatcher) {
 	rs = ConfigWatcher{
-		Prefix: strings.ToUpper(prefix),
-		array:  make(map[string]ConfigWatcherItem),
+		Prefix:      strings.ToUpper(prefix),
+		dataMap:     make(map[string]ConfigWatcherItem),
+		changeHooks: make([]configWatcherHook, 0, hooksCap),
+		hooksChan:   make(chan configWatcherHook, hooksCap),
 	}
 	rs.startWatch()
 	addCloser(&rs)
@@ -56,30 +67,41 @@ func (c *ConfigWatcher) startWatch() {
 				events clientv3.WatchResponse
 			)
 
-			for events = range rsp {
+			for {
 				if c.close {
 					return
 				}
-
-				for _, event = range events.Events {
-					if c.close {
-						return
-					}
-					srcKey = (string)(event.Kv.Key)
-					key = c.clearPrefix(srcKey)
-					switch event.Type {
-					case clientv3.EventTypeDelete: // 当key被删除时
-						if c.Exists(key) {
-							c.del(srcKey)
+				select {
+				case events = <-rsp:
+					for _, event = range events.Events {
+						if c.close {
+							return
 						}
-					case clientv3.EventTypePut: // 当key更新时
-						if v, exist := c.array[srcKey]; exist {
-							v.SetData((string)(event.Kv.Value))
-							c.save(srcKey, v)
+						srcKey = (string)(event.Kv.Key)
+						key = c.clearPrefix(srcKey)
+						switch event.Type {
+						case clientv3.EventTypeDelete: // 当key被删除时
+							if v := c.Get(key, false); v != nil {
+								c.del(srcKey)
+								c.doHook(srcKey, ConfigWatcherItem{Key: srcKey}, *v)
+							}
+						case clientv3.EventTypePut: // 当key更新时
+							if v := c.Get(key, false); v != nil {
+								old := *v
+								v.SetData((string)(event.Kv.Value))
+								c.save(srcKey, *v)
+								c.doHook(srcKey, *v, old)
+							} else {
+								c.doHook(srcKey, ConfigWatcherItem{Key: srcKey, data: (string)(event.Kv.Value)}, ConfigWatcherItem{Key: srcKey})
+							}
 						}
 					}
+				case hook := <-c.hooksChan:
+					// 将hook写入到hooks中
+					c.addHook(hook)
 				}
 			}
+
 		} else {
 			log.Panic(err)
 		}
@@ -98,19 +120,39 @@ func (c *ConfigWatcher) addPrefix(key string) string {
 }
 
 // Get 获取配置值
-func (c *ConfigWatcher) Get(key string) (item *ConfigWatcherItem) {
+// key 要获取的key，不需要添加前缀
+// new 当不存在时，是否创建一个新对应, 默认会创建一个新的对象
+func (c *ConfigWatcher) Get(key string, new ...bool) (item *ConfigWatcherItem) {
+
 	key = c.addPrefix(key)
 
-	if v, exists := c.array[key]; exists {
+	var isNew = true
+	if len(new) > 0 {
+		isNew = new[0]
+	}
+
+	if v, exists := c.dataMap[key]; exists {
 		item = &v
 		return
+	} else if !isNew { // 当不需要建新的对象时
+		return
 	}
+
+	var unlock = true
+	c.lock.RLock()
+	defer func() {
+		if unlock {
+			c.lock.RUnlock()
+		}
+	}()
 
 	if rs, err := Get(key); err == nil {
 		item = &ConfigWatcherItem{
 			data: rs,
 			Key:  key,
 		}
+		unlock = false
+		c.lock.RUnlock()
 		c.save(key, *item)
 	} else {
 		log.Error(err)
@@ -121,19 +163,68 @@ func (c *ConfigWatcher) Get(key string) (item *ConfigWatcherItem) {
 func (c *ConfigWatcher) save(key string, item ConfigWatcherItem) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	c.array[key] = item
+	c.dataMap[key] = item
 }
 
 func (c *ConfigWatcher) del(key string) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	delete(c.array, key)
+	delete(c.dataMap, key)
 }
 
 // Exists 判断配置是否存在
 func (c *ConfigWatcher) Exists(key string) bool {
-	if _, exists := c.array[c.addPrefix(key)]; exists {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	if _, exists := c.dataMap[c.addPrefix(key)]; exists {
 		return true
 	}
 	return false
+}
+
+// AddHook 添加一个配置hook
+// 当配置项目改变的时候，会调用这个hook
+func (c *ConfigWatcher) AddHook(key string, hook ConfigWatcherHookFunc, withPrefix ...bool) bool {
+	var prefix bool
+	if len(withPrefix) > 0 {
+		prefix = withPrefix[0]
+	}
+
+	var (
+		tmpHook = configWatcherHook{
+			Key:        c.addPrefix(key),
+			Hook:       hook,
+			WithPrefix: prefix,
+		}
+	)
+
+	c.hooksChan <- tmpHook
+
+	return true
+}
+
+// addHook 将数据写入到hooks中
+func (c *ConfigWatcher) addHook(hook configWatcherHook) {
+	c.hooksLock.Lock()
+	defer c.hooksLock.Unlock()
+	c.changeHooks = append(c.changeHooks, hook)
+}
+
+// doHook 执行Hook处理
+func (c *ConfigWatcher) doHook(key string, new ConfigWatcherItem, old ConfigWatcherItem) {
+	if len(c.changeHooks) > 0 {
+		new.Key = c.clearPrefix(new.Key)
+		old.Key = c.clearPrefix(old.Key)
+		c.hooksLock.RLock()
+		defer c.hooksLock.RUnlock()
+		for _, v := range c.changeHooks {
+			if v.WithPrefix { //　当为前缀匹配时
+				if strings.Index(key, v.Key) == 0 {
+					v.Hook(new, old)
+				}
+			} else if key == v.Key { // 完整匹配
+				v.Hook(new, old)
+			}
+		}
+	}
 }
