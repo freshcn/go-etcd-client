@@ -17,8 +17,8 @@ const (
 )
 
 // Put 设置数据
-func Put(key, value string, opOption ...clientv3.OpOption) (b bool, err error) {
-	_, err = Do(clientv3.OpPut(key, value, opOption...))
+func Put(key, value string, opts ...clientv3.OpOption) (b bool, err error) {
+	_, err = Do(clientv3.OpPut(key, value, opts...))
 	if err != nil {
 		return
 	}
@@ -27,8 +27,8 @@ func Put(key, value string, opOption ...clientv3.OpOption) (b bool, err error) {
 }
 
 // Get 获取数据
-func Get(key string, opOption ...clientv3.OpOption) (data string, err error) {
-	rs, err := Do(clientv3.OpGet(key, opOption...))
+func Get(key string, opts ...clientv3.OpOption) (data string, err error) {
+	rs, err := Do(clientv3.OpGet(key, opts...))
 	if err != nil {
 		return
 	}
@@ -39,8 +39,8 @@ func Get(key string, opOption ...clientv3.OpOption) (data string, err error) {
 }
 
 // Del 删除数据
-func Del(key string, opOption ...clientv3.OpOption) (b bool, err error) {
-	_, err = Do(clientv3.OpDelete(key, opOption...))
+func Del(key string, opts ...clientv3.OpOption) (b bool, err error) {
+	_, err = Do(clientv3.OpDelete(key, opts...))
 	if err != nil {
 		return
 	}
