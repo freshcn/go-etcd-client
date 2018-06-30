@@ -97,8 +97,8 @@ func (l *Lease) KeepAliveOnce(id int64) (rep LeaseGrantResponse, err error) {
 }
 
 // GetLease 获取租约的操作对象
-func (l *Lease) GetLease() clientv3.Lease {
-	return l.lease
+func (l *Lease) GetLease() *clientv3.Lease {
+	return &l.lease
 }
 
 // Close 关闭租约
